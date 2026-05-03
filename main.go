@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/joho/godotenv"
 )
@@ -16,11 +17,18 @@ type EmailRequest struct {
 	HTML    string `json:"html"`
 }
 
+var redisSvc *RedisService
+
 func init() {
 	err := godotenv.Load()
 	if err != nil {
 		log.Printf("Warning: could not load .env: %v\n", err)
 	}
+	redisSvc = NewRedisService(
+		os.Getenv("REDIS_ADDR"),
+		"go-email",
+		10000,
+	)
 }
 
 func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +45,7 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = SendTestEmail(req)
+	err = SendEmail(r.Context(), req, redisSvc)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
