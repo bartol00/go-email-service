@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ses"
@@ -29,10 +28,8 @@ func SendEmail(ctx context.Context, req EmailRequest, redisSvc *RedisService) er
 
 	client := ses.NewFromConfig(cfg)
 
-	from := os.Getenv("SENDER_EMAIL")
-
 	input := &ses.SendEmailInput{
-		Source: &from,
+		Source: ptr(req.From),
 		Destination: &types.Destination{
 			ToAddresses: []string{req.To},
 		},
