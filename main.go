@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/segmentio/kafka-go"
 )
 
 type EmailRequest struct {
@@ -32,32 +36,140 @@ func init() {
 	)
 }
 
-func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
-		return
+func main() {
+	broker := os.Getenv("KAFKA_BOOTSTRAP_SERVERS")
+	if broker == "" {
+		broker = "kafka:29092"
 	}
 
-	var req EmailRequest
-
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
+	topic := os.Getenv("KAFKA_EMAIL_TOPIC")
+	if topic == "" {
+		topic = "segurapass-email"
 	}
 
-	err = SendEmail(r.Context(), req, redisSvc)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	groupID := os.Getenv("KAFKA_CONSUMER_GROUP")
+	if groupID == "" {
+		groupID = "segurapass-go-email-consumer"
 	}
 
-	fmt.Fprintln(w, "Email successfully sent")
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	log.Printf(
+		"Email worker started. Kafka=%s topic=%s group=%s",
+		broker,
+		topic,
+		groupID,
+	)
+
+	for {
+		if ctx.Err() != nil {
+			break
+		}
+
+		reader := createKafkaReader(broker, topic, groupID)
+
+		log.Println("Kafka consumer connecting...")
+
+		err := consumeMessages(ctx, reader)
+
+		reader.Close()
+
+		if ctx.Err() != nil {
+			break
+		}
+
+		log.Printf(
+			"Kafka consumer stopped: %v",
+			err,
+		)
+
+		log.Println("Retrying Kafka consumer connection in 5 seconds...")
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+
+	log.Println("Email worker shutting down")
 }
 
-func main() {
-	http.HandleFunc("/send-email", sendEmailHandler)
+func createKafkaReader(broker, topic, groupID string) *kafka.Reader {
+	return kafka.NewReader(kafka.ReaderConfig{
+		Brokers: []string{broker},
+		Topic:   topic,
+		GroupID: groupID,
+	})
+}
 
-	fmt.Println("Server running on :9000")
-	log.Fatal(http.ListenAndServe(":9000", nil))
+func consumeMessages(ctx context.Context, reader *kafka.Reader) error {
+	for {
+		message, err := reader.FetchMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			return fmt.Errorf("Kafka receive error: %w", err)
+		}
+
+		var req EmailRequest
+
+		if err := json.Unmarshal(message.Value, &req); err != nil {
+			log.Printf(
+				"Invalid email message at offset %d: %v",
+				message.Offset,
+				err,
+			)
+
+			// Commit malformed messages so they don't block
+			// the consumer forever.
+			if err := reader.CommitMessages(ctx, message); err != nil {
+				return fmt.Errorf(
+					"failed to commit invalid message at offset %d: %w",
+					message.Offset,
+					err,
+				)
+			}
+
+			continue
+		}
+
+		log.Printf(
+			"Processing email for %s (offset %d)",
+			req.To,
+			message.Offset,
+		)
+
+		if err := SendEmail(ctx, req, redisSvc); err != nil {
+			log.Printf(
+				"Failed to send email at offset %d: %v",
+				message.Offset,
+				err,
+			)
+
+			// Do not commit the message.
+			// Kafka will make it available again.
+			continue
+		}
+
+		if err := reader.CommitMessages(ctx, message); err != nil {
+			return fmt.Errorf(
+				"failed to commit Kafka message at offset %d: %w",
+				message.Offset,
+				err,
+			)
+		}
+
+		log.Printf(
+			"Email successfully processed at offset %d",
+			message.Offset,
+		)
+	}
 }
